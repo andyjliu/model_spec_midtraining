@@ -32,6 +32,7 @@ from src.utils.parse_utils import (
     is_valid_generated_item,
     parse_v2_filter_response,
 )
+from src.utils.think_utils import strip_think_content
 from src.utils.training_data.filter_similar import dedup_by_cosine_similarity
 from safetytooling.data_models import Prompt, MessageRole, ChatMessage
 from safetytooling.utils import utils
@@ -839,8 +840,8 @@ class SpecAlignedChatGenerator(ChatGenerator):
 # =============================================================================
 
 def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> blocks from text."""
-    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+    """Remove serialized reasoning from an assistant response."""
+    return strip_think_content(text)
 
 
 def _strip_think_from_example(example: dict) -> dict:

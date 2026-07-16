@@ -24,10 +24,14 @@ from tqdm import tqdm
 
 from src.aft.generator import ChatGenerator, ChatGeneratorConfig
 from src.utils.file_utils import (
-    find_spec_path, load_prompt_template, parse_numbered_list,
+    find_spec_path, load_prompt_template,
     append_to_jsonl, generate_summary,
 )
-from src.utils.parse_utils import extract_numbered_items_from_xml, parse_v2_filter_response
+from src.utils.parse_utils import (
+    extract_strict_numbered_items,
+    is_valid_generated_item,
+    parse_v2_filter_response,
+)
 from src.utils.training_data.filter_similar import dedup_by_cosine_similarity
 from safetytooling.data_models import Prompt, MessageRole, ChatMessage
 from safetytooling.utils import utils
@@ -221,7 +225,9 @@ class SpecAlignedChatGenerator(ChatGenerator):
             prompt = Prompt(messages=[ChatMessage(role=MessageRole.user, content=prompt_text)])
             response = await self._api_call(prompt, max_tokens=2048, print_prompt_and_response=(batch_idx == 0))
 
-            new_domains = extract_numbered_items_from_xml(response, "output")
+            new_domains = extract_strict_numbered_items(
+                response, kind="domain", limit=batch_count
+            )
             if not new_domains:
                 consecutive_failures += 1
                 print(f"Warning: batch returned no domains ({consecutive_failures}/{max_retries} failures)")
@@ -310,7 +316,15 @@ class SpecAlignedChatGenerator(ChatGenerator):
                 prompt = Prompt(messages=[ChatMessage(role=MessageRole.user, content=prompt_text)])
                 response = await self._api_call(prompt, max_tokens=2000)
 
-                parsed = parse_numbered_list(response)
+                parsed = extract_strict_numbered_items(
+                    response, kind="question", limit=batch_count
+                )
+                if not parsed:
+                    print(
+                        f"Warning: no valid tagged questions for domain "
+                        f"{domain!r}; keeping {len(collected)} generated so far"
+                    )
+                    break
                 batch_results = [{'question': q, 'domain': domain} for q in parsed]
                 collected.extend(batch_results)
                 all_prev.extend(parsed)
@@ -398,11 +412,27 @@ class SpecAlignedChatGenerator(ChatGenerator):
         print("GENERATING SPEC-ALIGNED RESPONSES")
         print(f"{'='*70}")
 
+        valid_questions = [
+            q for q in questions
+            if is_valid_generated_item(q.get("question", ""), "question")
+            and is_valid_generated_item(q.get("domain", ""), "domain")
+        ]
+        if len(valid_questions) != len(questions):
+            print(
+                f"Skipping {len(questions) - len(valid_questions)} invalid "
+                "question/domain records before response generation"
+            )
+        questions = valid_questions
+
         responses_path = self.config.source_dir / "responses.jsonl"
 
         existing = []
         if responses_path.exists():
-            existing = utils.load_jsonl(responses_path)
+            existing = [
+                r for r in utils.load_jsonl(responses_path)
+                if is_valid_generated_item(r.get("question", ""), "question")
+                and is_valid_generated_item(r.get("domain", ""), "domain")
+            ]
             if len(existing) >= len(questions):
                 print(f"Loading existing responses from: {responses_path}")
                 return existing
@@ -651,7 +681,13 @@ class SpecAlignedChatGenerator(ChatGenerator):
     async def _generate_backfill_questions(self, n: int, existing_questions: set[str]) -> list[dict]:
         """Generate extra questions for backfill, spread across random domains."""
         per_domain = max(10, n // len(self.domains) + 1)
-        domains = list(self.domains)
+        domains = [
+            domain for domain in self.domains
+            if is_valid_generated_item(domain, "domain")
+        ]
+        if not domains:
+            print("No valid domains available for backfill; skipping")
+            return []
         random.shuffle(domains)
 
         all_questions = []
@@ -671,7 +707,9 @@ class SpecAlignedChatGenerator(ChatGenerator):
             )
             prompt = Prompt(messages=[ChatMessage(role=MessageRole.user, content=prompt_text)])
             response = await self._api_call(prompt, max_tokens=2000)
-            parsed = parse_numbered_list(response)
+            parsed = extract_strict_numbered_items(
+                response, kind="question", limit=per_domain
+            )
             return [{'question': q, 'domain': domain} for q in parsed if q not in existing_questions]
 
         tasks = {asyncio.create_task(gen_for_domain(d)) for d in domains}
@@ -692,6 +730,13 @@ class SpecAlignedChatGenerator(ChatGenerator):
 
     async def _generate_backfill_responses(self, questions: list[dict]) -> list[dict]:
         """Generate responses for backfill questions."""
+        questions = [
+            q for q in questions
+            if is_valid_generated_item(q.get("question", ""), "question")
+            and is_valid_generated_item(q.get("domain", ""), "domain")
+        ]
+        if not questions:
+            return []
         if self.config.use_batch_api:
             prompts = [self._create_response_prompt(q) for q in questions]
             responses = await self._batch_api_call(prompts, max_tokens=2048)
@@ -752,7 +797,22 @@ class SpecAlignedChatGenerator(ChatGenerator):
         print("SAVING FINAL DATASET")
         print(f"{'='*70}")
 
-        final_dataset = [{'messages': ex['messages']} for ex in examples]
+        valid_examples = [
+            ex for ex in examples
+            if ex.get("messages")
+            and is_valid_generated_item(
+                ex["messages"][0].get("content", ""), "question"
+            )
+            and is_valid_generated_item(
+                ex.get("metadata", {}).get("domain", ""), "domain"
+            )
+        ]
+        if len(valid_examples) != len(examples):
+            print(
+                f"Skipping {len(examples) - len(valid_examples)} invalid "
+                "examples before final dataset write"
+            )
+        final_dataset = [{'messages': ex['messages']} for ex in valid_examples]
 
         output_path = self.config.output_dir / "dataset.jsonl"
         utils.save_jsonl(output_path, final_dataset)
@@ -768,7 +828,7 @@ class SpecAlignedChatGenerator(ChatGenerator):
         generate_summary(
             output_dir=self.config.output_dir,
             dataset=final_dataset,
-            examples_with_metadata=examples,
+            examples_with_metadata=valid_examples,
         )
 
         print(f"{'='*70}\n")

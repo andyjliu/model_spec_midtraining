@@ -110,6 +110,26 @@ Think creatively about what dimensions of the spec remain unexplored — conside
 </existing_domains>""")
 
 
+DOMAIN_FORMAT_RETRY_TEMPLATE = textwrap.dedent("""
+Generate exactly {count} diverse conversation domains that are diagnostic of
+whether the assistant has internalized this spec:
+
+<spec>
+{spec}
+</spec>
+
+Return only a numbered list inside one complete <output> block. Do not include
+analysis, planning, headings, or text outside the block.
+
+<output>
+1. First domain
+2. Second domain
+...
+</output>
+{existing_domains}
+""").strip()
+
+
 # =============================================================================
 # VARIATION DIMENSIONS
 # =============================================================================
@@ -218,11 +238,18 @@ class SpecAlignedChatGenerator(ChatGenerator):
                 numbered = "\n".join(f"{i}. {d}" for i, d in enumerate(all_domains, 1))
                 existing_domains_section = "\n" + EXISTING_DOMAINS_TEMPLATE.format(numbered_domains=numbered)
 
-            prompt_text = self.domain_template.format(
-                spec=self.config.spec_content,
-                count=batch_count,
-                existing_domains=existing_domains_section
-            )
+            if consecutive_failures:
+                prompt_text = DOMAIN_FORMAT_RETRY_TEMPLATE.format(
+                    spec=self.config.spec_content,
+                    count=batch_count,
+                    existing_domains=existing_domains_section,
+                )
+            else:
+                prompt_text = self.domain_template.format(
+                    spec=self.config.spec_content,
+                    count=batch_count,
+                    existing_domains=existing_domains_section,
+                )
             prompt = Prompt(messages=[ChatMessage(role=MessageRole.user, content=prompt_text)])
             response = await self._api_call(prompt, max_tokens=2048, print_prompt_and_response=(batch_idx == 0))
 
@@ -241,6 +268,11 @@ class SpecAlignedChatGenerator(ChatGenerator):
             all_domains.extend(new_domains)
             batch_idx += 1
             print(f"Batch {batch_idx}: generated {len(new_domains)} domains (total: {len(all_domains)}/{num_domains})")
+
+        if not all_domains:
+            raise RuntimeError(
+                f"Domain generation failed: no parseable domains after {max_retries} attempts"
+            )
 
         print(f"\nTotal domains: {len(all_domains)}")
 

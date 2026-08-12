@@ -54,6 +54,79 @@ def extract_numbered_items_from_xml(text: str, tag: str = "output") -> list[str]
     return parse_numbered_list(content)
 
 
+_META_PREFIXES = (
+    "analyze ",
+    "deconstruct ",
+    "brainstorm",
+    "developing ",
+    "drafting ",
+    "final polish",
+    "review and refine",
+    "structure the ",
+)
+
+
+def is_valid_generated_item(text: str, kind: str) -> bool:
+    """Lightweight guard against planning/header leakage in generated lists.
+
+    This intentionally checks model-agnostic output shape rather than reasoning
+    syntax such as ``<think>``. It accepts rich domain descriptions and both
+    questions and imperative user requests, while rejecting the short markdown
+    process headings commonly emitted before a model's final answer.
+    """
+    if kind not in {"domain", "question"}:
+        raise ValueError(f"unknown generated item kind: {kind}")
+    item = text.strip()
+    if kind == "domain" and item.lower() == "unknown":
+        # Preserved for caller-supplied question files without domain metadata.
+        return True
+    if len(item) < 12 or len(item.split()) < 3:
+        return False
+    if re.search(r"<(?:question|domain)\d*>|\{(?:question|domain)", item, re.I):
+        return False
+
+    # Entirely bold/heading-shaped lines such as ``**Analyze User Input:**``.
+    if re.fullmatch(r"(?:#{1,6}\s+)?\*\*[^*]+(?::|\.\.\.)?\*\*", item):
+        return False
+
+    plain = re.sub(r"^[#*\s]+|[#*\s]+$", "", item).strip().lower()
+    if plain.startswith(_META_PREFIXES) and (
+        item.rstrip("*").endswith(":") or len(item.split()) <= 14
+    ):
+        return False
+    return True
+
+
+def extract_strict_numbered_items(
+    text: str,
+    *,
+    kind: str,
+    tag: str = "output",
+    limit: int | None = None,
+) -> list[str]:
+    """Parse and validate only the last complete tagged numbered list.
+
+    There is deliberately no raw-text fallback: prose or reasoning outside the
+    final ``<output>`` block must never become training data. Invalid items are
+    dropped, allowing callers to continue with a smaller dataset.
+    """
+    matches = list(
+        re.finditer(
+            rf"<{re.escape(tag)}\s*>(.*?)</{re.escape(tag)}\s*>",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+    )
+    if not matches:
+        return []
+    items = [
+        item
+        for item in parse_numbered_list(matches[-1].group(1))
+        if is_valid_generated_item(item, kind)
+    ]
+    return items if limit is None else items[:limit]
+
+
 def parse_v2_filter_response(response: str) -> bool:
     """Parse v2 filter response with <verdict> tag format."""
     verdict = extract_xml_tag(response, "verdict")

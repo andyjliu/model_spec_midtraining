@@ -11,7 +11,19 @@ from safetytooling.data_models import Prompt
 
 
 def find_spec_path(spec_name: str) -> Path:
-    """Find a spec text file by name, searching spec/ and its subdirectories."""
+    """Find a spec text file by name, searching spec/ and its subdirectories.
+
+    An absolute path to an existing .txt file is returned as-is, so callers
+    outside this repo can point at specs they own.
+    """
+    as_path = Path(spec_name)
+    if as_path.is_absolute():
+        if as_path.suffix != ".txt":
+            as_path = as_path.with_suffix(".txt")
+        if not as_path.exists():
+            raise FileNotFoundError(f"Spec file not found: {as_path}")
+        return as_path
+
     spec_filename = f"{spec_name}.txt"
     project_root = Path(__file__).resolve().parent.parent.parent
     spec_base_dir = project_root / "spec"

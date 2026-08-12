@@ -1,0 +1,52 @@
+name: multitenet_aft_n2000
+combos: combos.json
+value_set: ad_principles
+
+generation:
+  model: Qwen/Qwen3.6-27B
+  gpus: 8
+  mem: 96G
+  server_time: "2-00:00:00"
+  client_time: "1-00:00:00"
+  client_mem: 16G
+  n_samples: 2000
+  questions_per_domain: 50
+  max_concurrent_requests: 30
+  max_tokens: 2048
+  dedup_threshold: 0.91
+  response_style: value
+  prompt_version: v1
+  disable_thinking: true
+  use_llm_filter: true
+
+training:
+  model: allenai/OLMo-2-1124-7B
+  tag: olmo7b_base
+  time: "05:00:00"
+  mem: 48G
+  learning_rate: 1.0e-4
+  num_train_epochs: 2
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  eval_strategy: "no"
+  use_peft: true
+  lora_r: 32
+  lora_alpha: 64
+  lora_target_modules: [q_proj, v_proj, k_proj, o_proj, gate_proj, up_proj, down_proj]
+  report_to: wandb
+  seed: 42
+  wandb_project: valuegen
+
+evaluation:
+  scenarios: data/scenarios/ad_cs
+  judge: Qwen/Qwen3.6-27B
+  judge_gpus: 4
+  judge_mem: 96G
+  judge_time: "2-00:00:00"
+  task_time: "12:00:00"
+  task_mem: 32G
+  interactive: true
+  cache: true
+  filter: true

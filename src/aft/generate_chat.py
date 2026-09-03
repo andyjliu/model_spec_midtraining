@@ -12,6 +12,7 @@ Usage:
 """
 import asyncio
 import json
+import math
 import re
 import random
 import shutil
@@ -67,6 +68,14 @@ class Config(ChatGeneratorConfig):
     domain_batch_size: int = 50
     dedup_threshold: float = 0.91
     skip_dedup: bool = False
+
+    # Backfill loop (see run_backfill). Every default reproduces the historical
+    # behavior, so an unchanged launch command is an unchanged pipeline.
+    backfill_max_rounds: int = 3
+    backfill_pass_rate_scaled: bool = False  # size rounds by the observed filter pass rate
+    backfill_until_full: bool = False  # loop while gap > 0 instead of gap > BACKFILL_SLACK
+    backfill_dedup: bool = False  # cosine-dedup backfill questions against the kept pool
+    persist_backfill_responses: bool = True  # append to source/backfill_responses.jsonl
 
     def __post_init__(self):
         # Normalize empty strings from bash to None
@@ -761,6 +770,25 @@ class SpecAlignedChatGenerator(ChatGenerator):
 
         return all_questions[:n]
 
+    def dedup_backfill_questions(
+        self, questions: list[dict], kept_texts: list[str]
+    ) -> tuple[list[dict], int]:
+        """Drop backfill questions near-duplicate to the kept pool or to each other.
+
+        Same embedding/threshold as the base-round dedup. The pool goes first so
+        every duplicate pair (i < j) removes the *new* member: kept questions are
+        never touched. Returns (survivors, n_dropped).
+        """
+        if not questions:
+            return [], 0
+        texts = list(kept_texts) + [q["question"] for q in questions]
+        idx_to_remove, _ = dedup_by_cosine_similarity(
+            texts, threshold=self.config.dedup_threshold,
+        )
+        offset = len(kept_texts)
+        survivors = [q for i, q in enumerate(questions) if (i + offset) not in idx_to_remove]
+        return survivors, len(questions) - len(survivors)
+
     async def _generate_backfill_responses(self, questions: list[dict]) -> list[dict]:
         """Generate responses for backfill questions."""
         questions = [
@@ -894,6 +922,119 @@ def _is_json_serializable(v):
         return False
 
 
+BACKFILL_SLACK = 200  # historical stop-if-close threshold
+BACKFILL_OVERSHOOT = 1.1
+BACKFILL_MIN_PASS_RATE = 0.2  # floor for the pass-rate-scaled target
+
+
+def _backfill_open(config: Config, gap: int) -> bool:
+    threshold = 0 if config.backfill_until_full else BACKFILL_SLACK
+    return gap > threshold
+
+
+def _backfill_target(config: Config, gap: int, n_kept: int, n_removed: int) -> tuple[int, float]:
+    """Round size for a gap, plus the pass rate it was sized with."""
+    judged = n_kept + n_removed
+    pass_rate = (n_kept / judged) if judged else 1.0
+    if config.backfill_pass_rate_scaled:
+        target = math.ceil(gap / max(pass_rate, BACKFILL_MIN_PASS_RATE) * BACKFILL_OVERSHOOT)
+    else:
+        target = int(gap * BACKFILL_OVERSHOOT)
+    return target, pass_rate
+
+
+async def run_backfill(
+    generator: "SpecAlignedChatGenerator",
+    config: Config,
+    qa_pairs: list[dict],
+    filtered: list[dict],
+    removed: list[dict],
+) -> int:
+    """Top ``filtered`` up toward ``config.n_samples`` with extra questions.
+
+    Mutates the three lists in place and returns the number of rounds run.
+    With every ``backfill_*`` flag at its default this is the historical loop:
+    flat 1.1x rounds, stop inside a 200-row slack, at most 3 rounds. The flags
+    make the target pass-rate aware, loop until the gap closes, and dedup new
+    questions against the kept pool. Each round is logged to
+    ``source/backfill_log.jsonl``; with ``persist_backfill_responses`` the
+    generated responses go to ``source/backfill_responses.jsonl`` (never to
+    ``responses.jsonl``, which stays the base-round record) and a restarted run
+    re-filters them from the judge cache instead of regenerating them.
+    """
+    log_path = config.source_dir / "backfill_log.jsonl"
+    persisted_path = config.source_dir / "backfill_responses.jsonl"
+
+    if config.persist_backfill_responses and persisted_path.exists():
+        known = {q["question"] for q in qa_pairs}
+        prior = [
+            r for r in utils.load_jsonl(persisted_path)
+            if r["question"] not in known
+            and is_valid_generated_item(r.get("question", ""), "question")
+            and is_valid_generated_item(r.get("domain", ""), "domain")
+        ]
+        if prior:
+            print(f"Resuming: re-filtering {len(prior)} persisted backfill responses")
+            prior_kept, prior_removed = await generator.filter_examples(prior)
+            qa_pairs.extend(prior)
+            filtered.extend(prior_kept)
+            removed.extend(prior_removed)
+            append_to_jsonl(log_path, [{
+                "round": 0, "resumed": len(prior), "kept": len(prior_kept),
+                "cumulative": len(filtered),
+            }])
+
+    backfill_round = 0
+    while True:
+        gap = config.n_samples - len(filtered)
+        if not _backfill_open(config, gap):
+            stop_reason = "target"
+            break
+        if backfill_round >= config.backfill_max_rounds:
+            stop_reason = "round_cap"
+            break
+        backfill_round += 1
+        backfill_target, pass_rate = _backfill_target(config, gap, len(filtered), len(removed))
+        print(f"\n{'='*70}")
+        print(f"BACKFILL ROUND {backfill_round}: generating {backfill_target} extra samples "
+              f"(gap={gap}, pass_rate={pass_rate:.3f})")
+        print(f"{'='*70}")
+
+        existing_questions = set(q['question'] for q in qa_pairs)
+        backfill_questions = await generator._generate_backfill_questions(backfill_target, existing_questions)
+        n_generated = len(backfill_questions)
+        n_dedup_dropped = 0
+        if config.backfill_dedup:
+            kept_texts = [ex['messages'][0]['content'] for ex in filtered]
+            backfill_questions, n_dedup_dropped = generator.dedup_backfill_questions(
+                backfill_questions, kept_texts
+            )
+            print(f"Backfill dedup: dropped {n_dedup_dropped}/{n_generated}")
+
+        backfill_qa = await generator._generate_backfill_responses(backfill_questions)
+        if config.persist_backfill_responses and backfill_qa:
+            append_to_jsonl(persisted_path, backfill_qa)
+
+        backfill_kept, backfill_removed = await generator.filter_examples(backfill_qa)
+
+        qa_pairs.extend(backfill_qa)
+        filtered.extend(backfill_kept)
+        removed.extend(backfill_removed)
+        append_to_jsonl(log_path, [{
+            "round": backfill_round, "gap_before": gap, "pass_rate": pass_rate,
+            "target": backfill_target, "generated": n_generated,
+            "dedup_dropped": n_dedup_dropped, "responses": len(backfill_qa),
+            "kept": len(backfill_kept), "cumulative": len(filtered),
+        }])
+        print(f"After backfill round {backfill_round}: {len(filtered)} total samples")
+
+    append_to_jsonl(log_path, [{
+        "stop_reason": stop_reason, "rounds": backfill_round,
+        "final": len(filtered), "gap": config.n_samples - len(filtered),
+    }])
+    return backfill_round
+
+
 async def main():
     """Main generation pipeline."""
 
@@ -911,9 +1052,11 @@ async def main():
     output_path = config.output_dir / "dataset.jsonl"
     if output_path.exists() and config.skip_existing:
         existing = utils.load_jsonl(output_path)
-        print(f"\n✓ Dataset already exists with {len(existing)} samples")
-        print(f"  Set --skip_existing false to regenerate\n")
-        return
+        if len(existing) >= config.n_samples:
+            print(f"\n✓ Dataset already complete with {len(existing)} samples")
+            print(f"  Set --skip_existing false to regenerate\n")
+            return
+        print(f"\nDataset has {len(existing)} < {config.n_samples} samples; resuming backfill\n")
 
     print(f"\n{'='*70}")
     print(f"GENERATING {config.dataset_name.upper()}")
@@ -938,28 +1081,7 @@ async def main():
 
     filtered, removed = await generator.filter_examples(qa_pairs)
 
-    max_backfill_rounds = 3
-    backfill_round = 0
-    while config.n_samples - len(filtered) > 200 and backfill_round < max_backfill_rounds:
-        backfill_round += 1
-        gap = config.n_samples - len(filtered)
-        backfill_target = int(gap * 1.1)
-        print(f"\n{'='*70}")
-        print(f"BACKFILL ROUND {backfill_round}: generating {backfill_target} extra samples (gap={gap})")
-        print(f"{'='*70}")
-
-        existing_questions = set(q['question'] for q in qa_pairs)
-
-        backfill_questions = await generator._generate_backfill_questions(backfill_target, existing_questions)
-
-        backfill_qa = await generator._generate_backfill_responses(backfill_questions)
-
-        backfill_kept, backfill_removed = await generator.filter_examples(backfill_qa)
-
-        qa_pairs.extend(backfill_qa)
-        filtered.extend(backfill_kept)
-        removed.extend(backfill_removed)
-        print(f"After backfill round {backfill_round}: {len(filtered)} total samples")
+    backfill_round = await run_backfill(generator, config, qa_pairs, filtered, removed)
 
     if len(filtered) > config.n_samples:
         filtered = filtered[:config.n_samples]

@@ -28,6 +28,7 @@ class ChatGeneratorConfig(ExperimentConfigBase):
     use_batch_api: bool = False
     batch_timeout_minutes: int = 180
     anthropic_batch_tag: str = "ANTHROPIC_BATCH_API_KEY"
+    disable_thinking: bool = False
 
     def __post_init__(self):
         if self.output_dir is None:
@@ -64,6 +65,10 @@ class ChatGenerator(ABC):
 
     async def _api_call(self, prompt, max_tokens: int = None, **kwargs):
         """Make a single API call with semaphore."""
+        if self.config.disable_thinking:
+            chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}))
+            chat_template_kwargs.setdefault("enable_thinking", False)
+            kwargs["chat_template_kwargs"] = chat_template_kwargs
         async with self.semaphore:
             response = await single_prompt_api_call(
                 api=self.config.api,

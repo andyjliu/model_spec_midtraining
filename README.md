@@ -4,6 +4,13 @@ Code for [Model Spec Midtraining: Improving How Alignment Training Generalizes](
 
 Trained models are available at: https://huggingface.co/chloeli/collections
 
+> **Fork note.** This is a fork of [chloeli-15/model_spec_midtraining](https://github.com/chloeli-15/model_spec_midtraining),
+> used as a submodule by [value-generalization](https://github.com/andyjliu/value-generalization)
+> for its alignment-fine-tuning (AFT) arm. All method code is the original authors' work; please
+> cite their paper above. The fork adds multi-tenet AFT generation (spec-path handling,
+> generation-quality filters, a controller) and a backfill loop that tops up tenets short of
+> their target. No license file was published upstream; this fork adds none.
+
 MSM is a pipeline that takes a Model Spec or Constitution (a document describing how and why an assistant should behave) and generates a diverse corpus of synthetic documents that discuss and teach the content of the spec. 
 
 ## Installation

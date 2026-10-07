@@ -32,10 +32,11 @@ Importantly, if questions involves the user sharing its own negative emotions or
 {previous_questions_section}
 
 ## Output Format
-Output ONLY a numbered list of questions:
+If you reason or plan, keep it outside the <output> tags. Put only the final
+questions inside one <output> block:
+<output>
 1. <question1>
 2. <question2>
 3. <question3>
 ...
-
-Output ONLY the list, no other text.
+</output>

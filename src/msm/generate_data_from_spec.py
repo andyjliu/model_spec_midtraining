@@ -239,6 +239,10 @@ class Prompts:
 
 def validate_parsed_json(parsed: list[dict], required_keys: list[str]) -> list[dict]:
     validated_items = []
+    # A model asked for a list sometimes returns the single item bare (seen
+    # with open-weight generators when only one subdomain fits): accept it.
+    if isinstance(parsed, dict) and all(key in parsed for key in required_keys):
+        parsed = [parsed]
     for i, item in enumerate(parsed):
         if not isinstance(item, dict):
             print(f"Warning: Item at index {i} is not a dictionary, got {type(item)}: {item}")

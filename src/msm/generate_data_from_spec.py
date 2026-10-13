@@ -87,6 +87,18 @@ class DataGeneratorConfig(ExperimentConfigBase):
     tokenizer_name: str = "meta-llama/Llama-3.1-8B"
     exact_token_count: bool = False
     preview: bool = False
+    # Served open-weight generators (vLLM): send enable_thinking=False through
+    # the chat template so hybrid-thinking models answer directly, as the AFT
+    # generator does.
+    disable_thinking: bool = False
+    # Cap on the number of documents written (0 = every document idea). When
+    # the idea pool is larger, a seeded uniform sample of the ideas is
+    # generated, so the cap changes the corpus size but not its distribution.
+    max_documents: int = 0
+    max_documents_seed: int = 42
+    # Skip the tokenizer-based summary (callers that count tokens themselves,
+    # or have no access to `tokenizer_name`).
+    skip_token_count: bool = False
     data_dir: Path = field(init=False)
     output_dir: Path = field(init=False)
 
@@ -249,6 +261,11 @@ class DataGenerator:
 
         self.config.setup_experiment()
 
+        # Extra request kwargs for every streaming call (never the Batch API).
+        self.api_kwargs = {}
+        if self.config.disable_thinking:
+            self.api_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+
         if self.config.use_batch_api:
             self.batch_api_key = os.environ.get(self.config.anthropic_batch_tag)
             if not self.batch_api_key:
@@ -281,7 +298,8 @@ class DataGenerator:
                 MODEL_ID=self.config.model_id,
                 prompt=prompt,
                 max_tokens=min(self.config.n_domains*500, self.config.max_output_tokens),
-                temperature=self.config.temperature)
+                temperature=self.config.temperature,
+                **self.api_kwargs)
             parsed = parse_json_response(responses, prefill)
             domains = validate_parsed_json(parsed, required_keys=["domain"])
         except (json.JSONDecodeError, KeyError, ValueError) as e:
@@ -334,6 +352,7 @@ class DataGenerator:
                 prompt=prompt,
                 max_tokens=min(8192, self.config.max_output_tokens),
                 temperature=self.config.temperature,
+                **self.api_kwargs,
                 )
             for prompt in prompts
         ]
@@ -410,6 +429,7 @@ class DataGenerator:
                 prompt=prompt,
                 max_tokens=min(5000, self.config.max_output_tokens),
                 temperature=self.config.temperature,
+                **self.api_kwargs,
                 )
             for prompt in prompts
         ]
@@ -476,6 +496,7 @@ class DataGenerator:
                 prompt=prompt,
                 max_tokens=min(5000, self.config.max_output_tokens),
                 temperature=self.config.temperature,
+                **self.api_kwargs,
                 )
             for prompt in prompts
         ]
@@ -544,6 +565,7 @@ class DataGenerator:
                     prompt=prompt,
                     max_tokens=min(5000, self.config.max_output_tokens),
                     temperature=self.config.temperature,
+                    **self.api_kwargs,
                     )
 
         tasks = []
@@ -692,6 +714,7 @@ class DataGenerator:
                     prompt=prompt,
                     max_tokens=min(5000, self.config.max_output_tokens),
                     temperature=self.config.temperature,
+                    **self.api_kwargs,
                 )
 
         prompts = [
@@ -784,8 +807,39 @@ class DataGenerator:
                         doc_idea_infos.append((domain_dir, subdomain_dir, doc_type_dir, doc_meta, doc_idea))
         return doc_idea_infos
 
+    def _apply_document_cap(self, doc_idea_infos: list) -> list:
+        """Keep a seeded uniform sample of the pending ideas so that existing
+        plus new documents total at most ``max_documents``.
+
+        The sample is drawn from the *full* idea pool (existing documents
+        included) in a fixed order, so a resumed run selects the same ideas
+        as the first one and only generates the ones still missing."""
+        existing = sorted(str(p) for p in self.config.data_dir.rglob("*.txt"))
+        pending = {
+            str(info[2] / f"{sanitize_filename(info[4]['name'])}.txt"): info
+            for info in doc_idea_infos
+        }
+        pool = sorted(set(existing) | set(pending))
+        if len(pool) <= self.config.max_documents:
+            return doc_idea_infos
+        chosen = set(
+            random.Random(self.config.max_documents_seed).sample(
+                pool, self.config.max_documents
+            )
+        )
+        kept = [info for path, info in pending.items() if path in chosen]
+        print(
+            f"max_documents={self.config.max_documents}: idea pool {len(pool)}, "
+            f"{len(chosen & set(existing))} selected documents already exist, "
+            f"generating {len(kept)}"
+        )
+        return kept
+
     async def generate_all_documents(self, domains: list):
         doc_idea_infos = self._collect_doc_idea_infos(domains)
+
+        if self.config.max_documents > 0:
+            doc_idea_infos = self._apply_document_cap(doc_idea_infos)
 
         if not doc_idea_infos:
             print("All documents already generated, skipping...")
@@ -921,6 +975,12 @@ class DataGenerator:
         await self.generate_all_documents(domains)
 
         self.to_jsonl()
+
+        if self.config.skip_token_count:
+            self.generate_summary(None)
+            print(f"\nPipeline complete! Data saved to: {self.config.data_dir}")
+            print(f"JSONL files saved to: {self.config.output_dir}")
+            return
 
         plot_path = str(self.config.data_dir / "token_distribution.png")
         token_stats = count_dataset_tokens(
